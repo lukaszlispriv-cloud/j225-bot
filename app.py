@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.0, 06.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.1, 06.09.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
@@ -106,6 +106,11 @@ class CapitalClient:
                     raise RuntimeError(f"nie można przełączyć rachunku na {acc}: {r2.text[:200]}")
                 log.info("przełączono aktywny rachunek na %s", acc)
             log.info("zalogowano do Capital.com (%s), rachunek %s", CFG["CAPITAL_ENV"], body.get("currentAccountId"))
+            for a in body.get("accounts", []):
+                b = a.get("balance", {})
+                log.info("RACHUNEK %s | %s | %s | saldo %s | dostępne %s | domyślny=%s", a.get("accountId"), a.get("accountName"),
+                         a.get("currency"), b.get("balance"), b.get("available"), a.get("preferred"))
+            self.accounts_cache = body.get("accounts", [])
 
     def call(self, method, path, retry=True, **kw):
         if not self.cst or time.time() - self.logged_at > 540:   # sesja wygasa po 10 min bezczynności
@@ -323,6 +328,17 @@ def webhook():
     except Exception as e:
         log.exception("webhook: błąd"); return jsonify(ok=False, reason=str(e)), 500
     log.info("webhook -> %s", res); return jsonify(res)
+
+@app.get("/accounts")
+def list_accounts():
+    """Lista rachunków w bieżącym środowisku (demo/live). Wymaga nagłówka X-Secret = WEBHOOK_SECRET."""
+    if not _auth({"secret": request.headers.get("X-Secret", "")}): return jsonify(ok=False, reason="unauthorized"), 401
+    try:
+        accs = api.accounts()
+        return jsonify(env=CFG["CAPITAL_ENV"], accounts=[dict(accountId=a.get("accountId"), name=a.get("accountName"), currency=a.get("currency"),
+                       balance=a.get("balance", {}).get("balance"), available=a.get("balance", {}).get("available"), preferred=a.get("preferred")) for a in accs])
+    except Exception as e:
+        return jsonify(ok=False, reason=str(e)), 500
 
 @app.post("/close")
 def manual_close():
