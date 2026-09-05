@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: j225-bot
+    runtime: python
+    plan: starter            # starter = bez usypiania; free wymaga pingera (UptimeRobot)
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 60
+    envVars:
+      - key: CAPITAL_ENV
+        value: demo
+      - key: ARMED
+        value: "false"
+      - key: TRADING_ENABLED
+        value: "true"
+      - key: EPIC
+        value: J225
+      - key: RISK_FRACTION
+        value: "0.10"
+      - key: TP_PCT
+        value: "1.2"
+      - key: SL_PCT
+        value: "0.3"
+      - key: TIME_STOP_MIN
+        value: "240"
+      - key: CLOSE_BY
+        value: "09:00"
+      - key: GUARD_START
+        value: "02:00"
+      - key: GUARD_END
+        value: "08:55"
+      - key: TZ
+        value: Europe/Warsaw
+      - key: START_EQUITY
+        value: "218.59"
+      - key: MAX_DD_PCT
+        value: "10"
+      - key: MAX_DAILY_LOSS_USD
+        value: "6"
+      - key: CAPITAL_API_KEY
+        sync: false
+      - key: CAPITAL_IDENTIFIER
+        sync: false
+      - key: CAPITAL_PASSWORD
+        sync: false
+      - key: CAPITAL_ACCOUNT_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
