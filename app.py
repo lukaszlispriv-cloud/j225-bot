@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.1, 06.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.4, 08.09.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
@@ -59,6 +59,8 @@ CFG = dict(
     MAX_DD_PCT         = env("MAX_DD_PCT", 10.0, float),
     MAX_DAILY_LOSS_USD = env("MAX_DAILY_LOSS_USD", 6.0, float),
     STATE_FILE         = env("STATE_FILE", "state.json"),
+    HTTP_TIMEOUT       = env("HTTP_TIMEOUT", 10, int),
+    KEEPALIVE_URL      = env("KEEPALIVE_URL", ""),          # publiczny adres usługi -> samo-ping (plan Free)
     SUPERVISOR_SEC     = env("SUPERVISOR_SEC", 30, int),
     LOG_LEVEL          = env("LOG_LEVEL", "INFO"),
 )
@@ -94,18 +96,19 @@ class CapitalClient:
         with self.lock:
             r = self.s.post(BASE_URL + "/api/v1/session", headers=self._hdr(auth=False),
                             json={"identifier": CFG["CAPITAL_IDENTIFIER"], "password": CFG["CAPITAL_PASSWORD"],
-                                  "encryptedPassword": False}, timeout=20)
+                                  "encryptedPassword": False}, timeout=CFG["HTTP_TIMEOUT"])
             if r.status_code != 200:
                 raise RuntimeError(f"logowanie nieudane {r.status_code}: {r.text[:200]}")
             self.cst = r.headers.get("CST"); self.xst = r.headers.get("X-SECURITY-TOKEN"); self.logged_at = time.time()
             body = r.json()
             acc = CFG["CAPITAL_ACCOUNT_ID"]
             if acc and body.get("currentAccountId") != acc:
-                r2 = self.s.put(BASE_URL + "/api/v1/session", headers=self._hdr(), json={"accountId": acc}, timeout=20)
+                r2 = self.s.put(BASE_URL + "/api/v1/session", headers=self._hdr(), json={"accountId": acc}, timeout=CFG["HTTP_TIMEOUT"])
                 if r2.status_code != 200:
                     raise RuntimeError(f"nie można przełączyć rachunku na {acc}: {r2.text[:200]}")
                 log.info("przełączono aktywny rachunek na %s", acc)
-            log.info("zalogowano do Capital.com (%s), rachunek %s", CFG["CAPITAL_ENV"], body.get("currentAccountId"))
+            eff = CFG["CAPITAL_ACCOUNT_ID"] or body.get("currentAccountId")
+            log.info("zalogowano do Capital.com (%s), AKTYWNY RACHUNEK: %s", CFG["CAPITAL_ENV"], eff)
             for a in body.get("accounts", []):
                 b = a.get("balance", {})
                 log.info("RACHUNEK %s | %s | %s | saldo %s | dostępne %s | domyślny=%s", a.get("accountId"), a.get("accountName"),
@@ -115,7 +118,7 @@ class CapitalClient:
     def call(self, method, path, retry=True, **kw):
         if not self.cst or time.time() - self.logged_at > 540:   # sesja wygasa po 10 min bezczynności
             self.login()
-        r = self.s.request(method, BASE_URL + path, headers=self._hdr(), timeout=20, **kw)
+        r = self.s.request(method, BASE_URL + path, headers=self._hdr(), timeout=CFG["HTTP_TIMEOUT"], **kw)
         if r.status_code == 401 and retry:
             self.login(); return self.call(method, path, retry=False, **kw)
         self.logged_at = time.time()
@@ -158,7 +161,7 @@ class State:
     def __init__(self, path):
         self.path = path; self.lock = threading.Lock()
         self.d = {"position": None, "last_signal": None, "seen": [], "day": None, "day_pnl": 0.0,
-                  "trades": [], "halted": False, "halt_reason": ""}
+                  "trades": [], "halted": False, "halt_reason": "", "own_deals": [], "foreign_warned": []}
         try:
             with open(path) as f: self.d.update(json.load(f))
         except Exception: pass
@@ -216,14 +219,6 @@ def risk_checks(balance):
     if st.d["day_pnl"] <= -abs(CFG["MAX_DAILY_LOSS_USD"]): return False, f"limit dziennej straty ({st.d['day_pnl']:.2f} USD)"
     return True, ""
 
-def bot_position():
-    """Otwarta pozycja bota u brokera (BUY na EPIC) lub None."""
-    for p in api.positions():
-        pos, mk = p["position"], p["market"]
-        if mk.get("epic") == CFG["EPIC"] and pos.get("direction") == "BUY":
-            return pos
-    return None
-
 def handle_signal(payload):
     """Główna ścieżka: sygnał -> kontrole -> zlecenie BUY z TP/SL."""
     with st.lock:
@@ -236,7 +231,7 @@ def handle_signal(payload):
         balance, available = api.balance()
         ok, why = risk_checks(balance)
         if not ok: return {"ok": False, "reason": why}
-        if bot_position() is not None or st.d["position"]: return {"ok": False, "reason": "pozycja już otwarta - sygnał pominięty"}
+        if st.d["position"] or _any_epic_long(): return {"ok": False, "reason": "pozycja na J225 już otwarta (własna lub obca) - sygnał pominięty"}
         mkt = api.market(CFG["EPIC"]); fx = fx_rate()
         size, info = compute_size(balance, mkt, fx)
         if size < info["step"]: return {"ok": False, "reason": f"za mały rachunek na min. rozmiar {info['step']} (obliczono {info['raw']})"}
@@ -257,34 +252,68 @@ def handle_signal(payload):
         except Exception as e: log.warning("nie udało się doprecyzować TP/SL: %s", e)
         st.d["position"] = dict(deal_id=deal_id, level=level, size=size, open_time=str(t), deadline=str(deadline_for(t)),
                                 sl=round(level * (1 - sl_pct / 100), 1), tp=round(level * (1 + tp_pct / 100), 1))
+        st.d["own_deals"] = (st.d.get("own_deals", []) + [deal_id])[-50:]
         st.save(); log.info("OTWARTO LONG %s size=%s @ %s TP=%s SL=%s deadline=%s", CFG["EPIC"], size, level,
                             st.d["position"]["tp"], st.d["position"]["sl"], st.d["position"]["deadline"])
         return {"ok": True, "position": st.d["position"]}
 
+def _opened_at(broker):
+    try: return datetime.fromisoformat(broker["createdDateUTC"].replace("Z", "+00:00")).astimezone(TZ)
+    except Exception: return None
+
+def _is_ours(broker):
+    """Pozycja jest bota, jeśli zapisał jej dealId, albo została otwarta DZIŚ w oknie wejść (odbudowa po restarcie)."""
+    if broker["dealId"] in st.d.get("own_deals", []): return True
+    opened = _opened_at(broker)
+    return bool(opened and opened.date() == now_local().date() and in_guard(opened))
+
+def bot_position_ours():
+    """Otwarta pozycja bota (BUY na EPIC, spełniająca _is_ours) lub None; obce pozycje tylko loguje."""
+    for p in api.positions():
+        pos, mk = p["position"], p["market"]
+        if mk.get("epic") != CFG["EPIC"] or pos.get("direction") != "BUY": continue
+        if _is_ours(pos): return pos
+        if pos["dealId"] not in st.d.get("foreign_warned", []):
+            st.d["foreign_warned"] = (st.d.get("foreign_warned", []) + [pos["dealId"]])[-50:]; st.save()
+            log.warning("OBCA pozycja BUY %s na %s (otwarta %s, size %s) - bot jej NIE zarządza i nie otworzy własnej, dopóki istnieje",
+                        pos["dealId"], CFG["EPIC"], pos.get("createdDateUTC"), pos.get("size"))
+    return None
+
+def _any_epic_long():
+    return any(p["market"].get("epic") == CFG["EPIC"] and p["position"].get("direction") == "BUY" for p in api.positions())
+
 def supervisor():
     """Wątek nadzorcy: keep-alive sesji, time-stop / CLOSE_BY, wykrycie zamknięcia przez TP/SL, księgowanie wyniku."""
-    last_ping = 0
+    last_ping = 0; closed_market_until = 0
     while True:
         try:
             if time.time() - last_ping > 300:
                 api.ping(); last_ping = time.time()
             with st.lock:
                 pos = st.d["position"]
-                broker = bot_position()
-                if pos is None and broker is not None:          # odbudowa stanu po restarcie
-                    opened = datetime.fromisoformat(broker["createdDateUTC"].replace("Z", "+00:00")).astimezone(TZ) \
-                        if broker.get("createdDateUTC") else now_local()
+                broker = bot_position_ours()
+                if pos is None and broker is not None:          # odbudowa stanu po restarcie (tylko własna pozycja)
+                    opened = _opened_at(broker) or now_local()
                     st.d["position"] = dict(deal_id=broker["dealId"], level=float(broker["level"]), size=float(broker["size"]),
                                             open_time=str(opened), deadline=str(deadline_for(opened)),
                                             sl=broker.get("stopLevel"), tp=broker.get("profitLevel"))
                     st.save(); log.warning("odbudowano stan pozycji z brokera: %s", st.d["position"]); pos = st.d["position"]
                 if pos is not None:
-                    if broker is None:                             # zamknięta przez TP/SL u brokera
-                        pnl = _settle(pos, reason="TP/SL brokera")
-                    elif now_local() >= datetime.fromisoformat(pos["deadline"]):
+                    if broker is None or broker["dealId"] != pos["deal_id"]:   # zamknięta przez TP/SL u brokera
+                        _settle(pos, reason="TP/SL brokera")
+                    elif now_local() >= datetime.fromisoformat(pos["deadline"]) and time.time() >= closed_market_until:
                         if CFG["ARMED"]:
-                            api.close(pos["deal_id"]); log.info("TIME-STOP: zamknięto %s", pos["deal_id"])
-                        pnl = _settle(pos, reason="time-stop/CLOSE_BY", upl=broker.get("upl"))
+                            try:
+                                api.close(pos["deal_id"]); log.info("TIME-STOP: zamknięto %s", pos["deal_id"])
+                                _settle(pos, reason="time-stop/CLOSE_BY", upl=broker.get("upl"))
+                            except RuntimeError as e:
+                                if "currently closed" in str(e) or "closed" in str(e).lower():
+                                    closed_market_until = time.time() + 600
+                                    log.warning("rynek zamknięty - ponowię zamknięcie %s za 10 min", pos["deal_id"])
+                                else: raise
+                        else:
+                            log.info("TRYB SUCHY: minął termin pozycji %s (nie zamykam, ARMED=false)", pos["deal_id"])
+                            _settle(pos, reason="time-stop (tryb suchy, bez zlecenia)", upl=broker.get("upl"))
         except Exception as e:
             log.error("nadzorca: %s", e)
         time.sleep(CFG["SUPERVISOR_SEC"])
@@ -304,13 +333,14 @@ def _auth(payload):
     return bool(sec) and hmac.compare_digest(str(payload.get("secret", "")), sec)
 
 @app.get("/")
+@app.get("/health")
 def health():
     return jsonify(ok=True, bot="J225 5m LONG", env=CFG["CAPITAL_ENV"], armed=CFG["ARMED"], time=str(now_local()))
 
 @app.get("/status")
 def status():
     try: balance, available = api.balance()
-    except Exception as e: balance, available = None, str(e)
+    except Exception as e: balance, available = None, f"broker niedostępny: {e}"
     return jsonify(env=CFG["CAPITAL_ENV"], armed=CFG["ARMED"], trading_enabled=CFG["TRADING_ENABLED"], halted=st.d["halted"],
                    halt_reason=st.d["halt_reason"], balance=balance, available=available, position=st.d["position"],
                    day_pnl=st.d["day_pnl"], last_signal=st.d["last_signal"], trades=st.d["trades"][-10:],
@@ -319,10 +349,13 @@ def status():
 
 @app.post("/webhook")
 def webhook():
+    log.info("PRZYSZEDŁ WEBHOOK z %s, %d bajtów", request.headers.get("X-Forwarded-For", request.remote_addr), len(request.data or b""))
     payload = request.get_json(silent=True) or {}
     if not payload:
         try: payload = json.loads(request.data.decode("utf-8"))
-        except Exception: return jsonify(ok=False, reason="brak JSON"), 400
+        except Exception:
+            log.error("webhook: treść nie jest JSON-em: %s", (request.data or b"")[:200])
+            return jsonify(ok=False, reason="brak JSON"), 400
     if not _auth(payload): log.warning("webhook: zły sekret"); return jsonify(ok=False, reason="unauthorized"), 401
     try: res = handle_signal(payload)
     except Exception as e:
@@ -345,7 +378,7 @@ def manual_close():
     payload = request.get_json(silent=True) or {}
     if not _auth(payload): return jsonify(ok=False, reason="unauthorized"), 401
     with st.lock:
-        pos = st.d["position"] or ({"deal_id": bot_position()["dealId"]} if bot_position() else None)
+        pos = st.d["position"] or ({"deal_id": bot_position_ours()["dealId"]} if bot_position_ours() else None)
         if not pos: return jsonify(ok=False, reason="brak pozycji")
         if CFG["ARMED"]: api.close(pos["deal_id"])
         _settle(pos if "level" in pos else dict(pos, level=None, size=None, open_time=None, deadline=None, sl=None, tp=None), "ręczne zamknięcie")
@@ -371,7 +404,40 @@ def _selftest():
     print("selftest OK | saldo 218.59 USD -> depozyt", info["margin_usd"], "USD, nominał", info["notional_usd"],
           "USD, size", size, "(surowe", info["raw"], ")")
 
+def startup_banner():
+    log.info("=" * 70)
+    log.info("BOT J225 5m LONG | env=%s | rachunek=%s | ARMED=%s | TRADING_ENABLED=%s",
+             CFG["CAPITAL_ENV"], CFG["CAPITAL_ACCOUNT_ID"] or "(domyślny)", CFG["ARMED"], CFG["TRADING_ENABLED"])
+    log.info("okno wejść %s-%s %s | TP %.2f%% | SL %.2f%% | time-stop %d min | zamknięcie %s | depozyt %.0f%% salda",
+             CFG["GUARD_START"], CFG["GUARD_END"], CFG["TZ"], CFG["TP_PCT"], CFG["SL_PCT"],
+             CFG["TIME_STOP_MIN"], CFG["CLOSE_BY"], CFG["RISK_FRACTION"] * 100)
+    log.info("adres dla TradingView: <adres-usługi>/webhook   (sprawdzenie stanu: /status)")
+    if not CFG["WEBHOOK_SECRET"]:
+        log.critical("UWAGA: WEBHOOK_SECRET jest PUSTY - bot odrzuci KAŻDY sygnał (401). Ustaw zmienną w Render.")
+    if not CFG["ARMED"]:
+        log.warning("UWAGA: ARMED=false - sygnały będą tylko logowane (tryb suchy), bez składania zleceń.")
+    if not CFG["TRADING_ENABLED"]:
+        log.warning("UWAGA: TRADING_ENABLED=false - nowe wejścia wstrzymane.")
+    if st.d.get("halted"):
+        log.warning("UWAGA: bot zatrzymany (%s) - wznów przez /halt z halted:false.", st.d.get("halt_reason"))
+    log.info("=" * 70)
+
+def keepalive():
+    """Samo-ping publicznego adresu co 10 min - zapobiega usypianiu usługi na planie Free Render."""
+    url = CFG["KEEPALIVE_URL"].rstrip("/") + "/"
+    while True:
+        time.sleep(600)
+        try: requests.get(url, timeout=8)
+        except Exception as e: log.debug("keepalive: %s", e)
+
+startup_banner()
 threading.Thread(target=supervisor, daemon=True).start()
+if CFG["KEEPALIVE_URL"]:
+    threading.Thread(target=keepalive, daemon=True).start()
+    log.info("keep-alive włączony: %s co 10 min", CFG["KEEPALIVE_URL"])
+else:
+    log.warning("keep-alive wyłączony. Na planie Free usługa zaśnie po ~15 min i webhook z TradingView PRZEPADNIE. "
+                "Ustaw KEEPALIVE_URL=<adres usługi> lub monitor UptimeRobot co 5 min.")
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv: _selftest()
