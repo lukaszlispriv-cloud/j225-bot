@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.4, 08.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.5, 17.09.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
@@ -220,42 +220,89 @@ def risk_checks(balance):
     return True, ""
 
 def handle_signal(payload):
-    """Główna ścieżka: sygnał -> kontrole -> zlecenie BUY z TP/SL."""
+    """Sygnał -> kontrole -> zlecenie BUY z TP/SL. Zapytania sieciowe POZA blokadą stanu; każdy krok logowany."""
+    t0 = time.time()
+    t = now_local(); sig_id = str(payload.get("signal_time") or t.strftime("%Y-%m-%d %H:%M"))
+
+    if not st.lock.acquire(timeout=20):
+        log.error("KROK 0: blokada stanu zajęta >20 s - sygnał %s ODRZUCONY", sig_id)
+        return {"ok": False, "reason": "bot zajęty (blokada stanu)"}
+    try:
+        if sig_id in st.d["seen"]:
+            return {"ok": False, "reason": "duplikat sygnału " + sig_id}
+        st.d["seen"] = (st.d["seen"] + [sig_id])[-50:]
+        st.d["last_signal"] = {"t": str(t), "payload": payload}
+        st.save()
+        own_pos = st.d["position"]
+    finally:
+        st.lock.release()
+    log.info("KROK 0 OK (%.1fs): sygnał %s zarejestrowany", time.time() - t0, sig_id)
+
+    if str(payload.get("action", "buy")).lower() != "buy":
+        return {"ok": False, "reason": "bot obsługuje tylko action=buy"}
+    if str(payload.get("symbol", CFG["EPIC"])).upper() != CFG["EPIC"].upper():
+        return {"ok": False, "reason": "inny symbol: " + str(payload.get("symbol"))}
+    if not in_guard(t):
+        return {"ok": False, "reason": f"poza oknem wejść {CFG['GUARD_START']}-{CFG['GUARD_END']} ({t:%H:%M})"}
+    if own_pos:
+        return {"ok": False, "reason": "bot ma już otwartą pozycję - sygnał pominięty"}
+
+    _t = time.time(); log.info("KROK 1: pobieram saldo...")
+    balance, available = api.balance()
+    log.info("KROK 1 OK (%.1fs): saldo %.2f, dostępne %.2f", time.time() - _t, balance, available)
+
     with st.lock:
-        t = now_local(); sig_id = str(payload.get("signal_time") or t.strftime("%Y-%m-%d %H:%M"))
-        if sig_id in st.d["seen"]: return {"ok": False, "reason": "duplikat sygnału " + sig_id}
-        st.d["seen"] = (st.d["seen"] + [sig_id])[-50:]; st.d["last_signal"] = {"t": str(t), "payload": payload}; st.save()
-        if str(payload.get("action", "buy")).lower() != "buy": return {"ok": False, "reason": "bot obsługuje tylko action=buy"}
-        if str(payload.get("symbol", CFG["EPIC"])).upper() != CFG["EPIC"].upper(): return {"ok": False, "reason": "inny symbol"}
-        if not in_guard(t): return {"ok": False, "reason": f"poza oknem wejść {CFG['GUARD_START']}-{CFG['GUARD_END']} ({t:%H:%M})"}
-        balance, available = api.balance()
         ok, why = risk_checks(balance)
-        if not ok: return {"ok": False, "reason": why}
-        if st.d["position"] or _any_epic_long(): return {"ok": False, "reason": "pozycja na J225 już otwarta (własna lub obca) - sygnał pominięty"}
-        mkt = api.market(CFG["EPIC"]); fx = fx_rate()
-        size, info = compute_size(balance, mkt, fx)
-        if size < info["step"]: return {"ok": False, "reason": f"za mały rachunek na min. rozmiar {info['step']} (obliczono {info['raw']})"}
-        tp_pct = float(payload.get("tp_pct", CFG["TP_PCT"])); sl_pct = float(payload.get("sl_pct", CFG["SL_PCT"]))
-        stop_dist = round(info["price"] * sl_pct / 100, 1); profit_dist = round(info["price"] * tp_pct / 100, 1)
-        plan = dict(epic=CFG["EPIC"], size=size, price=info["price"], stop_dist=stop_dist, profit_dist=profit_dist,
-                    margin_usd=info["margin_usd"], notional_usd=info["notional_usd"], balance=balance, fx=round(fx, 3),
-                    deadline=str(deadline_for(t)))
-        if not CFG["ARMED"]:
-            log.info("TRYB SUCHY (ARMED=false) - zlecenie NIE wysłane: %s", plan); return {"ok": True, "dry_run": True, "plan": plan}
-        ref = api.open_buy(CFG["EPIC"], size, stop_dist, profit_dist)["dealReference"]
-        conf = api.confirm(ref)
-        if conf.get("dealStatus") != "ACCEPTED":
-            log.error("zlecenie odrzucone: %s", conf); return {"ok": False, "reason": "odrzucone", "confirm": conf}
-        deal_id = conf["affectedDeals"][0]["dealId"]; level = float(conf.get("level") or info["price"])
-        # doprecyzowanie TP/SL względem faktycznej ceny wypełnienia
-        try: api.update_levels(deal_id, round(level * (1 - sl_pct / 100), 1), round(level * (1 + tp_pct / 100), 1))
-        except Exception as e: log.warning("nie udało się doprecyzować TP/SL: %s", e)
+    if not ok:
+        return {"ok": False, "reason": why}
+
+    _t = time.time(); log.info("KROK 2: sprawdzam pozycje u brokera...")
+    if _any_epic_long():
+        log.info("KROK 2 (%.1fs): na %s jest już long (własny lub obcy)", time.time() - _t, CFG["EPIC"])
+        return {"ok": False, "reason": f"pozycja na {CFG['EPIC']} już otwarta - sygnał pominięty"}
+    log.info("KROK 2 OK (%.1fs): brak otwartych pozycji", time.time() - _t)
+
+    _t = time.time(); log.info("KROK 3: pobieram dane rynku i kurs walutowy...")
+    mkt = api.market(CFG["EPIC"]); fx = fx_rate()
+    size, info = compute_size(balance, mkt, fx)
+    log.info("KROK 3 OK (%.1fs): cena %.1f, kurs %.2f, wielkość %s (surowo %.3f, krok %s)",
+             time.time() - _t, info["price"], fx, size, info["raw"], info["step"])
+    if size < info["step"]:
+        return {"ok": False, "reason": f"za mały rachunek na min. rozmiar {info['step']} (obliczono {info['raw']})"}
+
+    tp_pct = float(payload.get("tp_pct", CFG["TP_PCT"])); sl_pct = float(payload.get("sl_pct", CFG["SL_PCT"]))
+    stop_dist = round(info["price"] * sl_pct / 100, 1); profit_dist = round(info["price"] * tp_pct / 100, 1)
+    plan = dict(epic=CFG["EPIC"], size=size, price=info["price"], stop_dist=stop_dist, profit_dist=profit_dist,
+                margin_usd=info["margin_usd"], notional_usd=info["notional_usd"], balance=balance, fx=round(fx, 3),
+                deadline=str(deadline_for(t)))
+    if not CFG["ARMED"]:
+        log.info("TRYB SUCHY (ARMED=false) - zlecenie NIE wysłane: %s", plan)
+        return {"ok": True, "dry_run": True, "plan": plan}
+
+    _t = time.time(); log.info("KROK 4: wysyłam BUY size=%s stopDistance=%s profitDistance=%s", size, stop_dist, profit_dist)
+    ref = api.open_buy(CFG["EPIC"], size, stop_dist, profit_dist)["dealReference"]
+    log.info("KROK 4 OK (%.1fs): dealReference=%s, czekam na potwierdzenie", time.time() - _t, ref)
+
+    conf = api.confirm(ref)
+    if conf.get("dealStatus") != "ACCEPTED":
+        log.error("KROK 5: ZLECENIE ODRZUCONE przez brokera: %s", conf)
+        return {"ok": False, "reason": "odrzucone przez brokera", "confirm": conf}
+    deal_id = conf["affectedDeals"][0]["dealId"]; level = float(conf.get("level") or info["price"])
+    log.info("KROK 5 OK: przyjęte, dealId=%s, wypełnienie %.1f", deal_id, level)
+
+    try:
+        api.update_levels(deal_id, round(level * (1 - sl_pct / 100), 1), round(level * (1 + tp_pct / 100), 1))
+    except Exception as e:
+        log.warning("KROK 6: nie udało się doprecyzować TP/SL: %s", e)
+
+    with st.lock:
         st.d["position"] = dict(deal_id=deal_id, level=level, size=size, open_time=str(t), deadline=str(deadline_for(t)),
                                 sl=round(level * (1 - sl_pct / 100), 1), tp=round(level * (1 + tp_pct / 100), 1))
         st.d["own_deals"] = (st.d.get("own_deals", []) + [deal_id])[-50:]
-        st.save(); log.info("OTWARTO LONG %s size=%s @ %s TP=%s SL=%s deadline=%s", CFG["EPIC"], size, level,
-                            st.d["position"]["tp"], st.d["position"]["sl"], st.d["position"]["deadline"])
-        return {"ok": True, "position": st.d["position"]}
+        st.save(); pos = st.d["position"]
+    log.info("OTWARTO LONG %s size=%s @ %s TP=%s SL=%s deadline=%s (łącznie %.1fs)",
+             CFG["EPIC"], size, level, pos["tp"], pos["sl"], pos["deadline"], time.time() - t0)
+    return {"ok": True, "position": pos}
 
 def _opened_at(broker):
     try: return datetime.fromisoformat(broker["createdDateUTC"].replace("Z", "+00:00")).astimezone(TZ)
@@ -283,37 +330,42 @@ def _any_epic_long():
     return any(p["market"].get("epic") == CFG["EPIC"] and p["position"].get("direction") == "BUY" for p in api.positions())
 
 def supervisor():
-    """Wątek nadzorcy: keep-alive sesji, time-stop / CLOSE_BY, wykrycie zamknięcia przez TP/SL, księgowanie wyniku."""
+    """Nadzorca: keep-alive, time-stop/CLOSE_BY, wykrycie zamknięcia przez TP/SL.
+    Zapytania sieciowe wykonywane POZA blokadą stanu, żeby nigdy nie blokować obsługi webhooka."""
     last_ping = 0; closed_market_until = 0
     while True:
         try:
             if time.time() - last_ping > 300:
                 api.ping(); last_ping = time.time()
+            broker = bot_position_ours()                       # sieć poza blokadą
+            to_close = None
             with st.lock:
                 pos = st.d["position"]
-                broker = bot_position_ours()
-                if pos is None and broker is not None:          # odbudowa stanu po restarcie (tylko własna pozycja)
+                if pos is None and broker is not None:
                     opened = _opened_at(broker) or now_local()
-                    st.d["position"] = dict(deal_id=broker["dealId"], level=float(broker["level"]), size=float(broker["size"]),
-                                            open_time=str(opened), deadline=str(deadline_for(opened)),
-                                            sl=broker.get("stopLevel"), tp=broker.get("profitLevel"))
-                    st.save(); log.warning("odbudowano stan pozycji z brokera: %s", st.d["position"]); pos = st.d["position"]
+                    pos = dict(deal_id=broker["dealId"], level=float(broker["level"]), size=float(broker["size"]),
+                               open_time=str(opened), deadline=str(deadline_for(opened)),
+                               sl=broker.get("stopLevel"), tp=broker.get("profitLevel"))
+                    st.d["position"] = pos; st.save()
+                    log.warning("odbudowano stan pozycji z brokera: %s", pos)
                 if pos is not None:
-                    if broker is None or broker["dealId"] != pos["deal_id"]:   # zamknięta przez TP/SL u brokera
+                    if broker is None or broker["dealId"] != pos["deal_id"]:
                         _settle(pos, reason="TP/SL brokera")
                     elif now_local() >= datetime.fromisoformat(pos["deadline"]) and time.time() >= closed_market_until:
-                        if CFG["ARMED"]:
-                            try:
-                                api.close(pos["deal_id"]); log.info("TIME-STOP: zamknięto %s", pos["deal_id"])
-                                _settle(pos, reason="time-stop/CLOSE_BY", upl=broker.get("upl"))
-                            except RuntimeError as e:
-                                if "currently closed" in str(e) or "closed" in str(e).lower():
-                                    closed_market_until = time.time() + 600
-                                    log.warning("rynek zamknięty - ponowię zamknięcie %s za 10 min", pos["deal_id"])
-                                else: raise
-                        else:
-                            log.info("TRYB SUCHY: minął termin pozycji %s (nie zamykam, ARMED=false)", pos["deal_id"])
-                            _settle(pos, reason="time-stop (tryb suchy, bez zlecenia)", upl=broker.get("upl"))
+                        to_close = pos
+            if to_close is not None:                           # sieć poza blokadą
+                if CFG["ARMED"]:
+                    try:
+                        api.close(to_close["deal_id"]); log.info("TIME-STOP: zamknięto %s", to_close["deal_id"])
+                        with st.lock: _settle(to_close, reason="time-stop/CLOSE_BY", upl=(broker or {}).get("upl"))
+                    except RuntimeError as e:
+                        if "closed" in str(e).lower():
+                            closed_market_until = time.time() + 600
+                            log.warning("rynek zamknięty - ponowię zamknięcie %s za 10 min", to_close["deal_id"])
+                        else: raise
+                else:
+                    log.info("TRYB SUCHY: minął termin pozycji %s (nie zamykam, ARMED=false)", to_close["deal_id"])
+                    with st.lock: _settle(to_close, reason="time-stop (tryb suchy, bez zlecenia)", upl=(broker or {}).get("upl"))
         except Exception as e:
             log.error("nadzorca: %s", e)
         time.sleep(CFG["SUPERVISOR_SEC"])
@@ -357,10 +409,13 @@ def webhook():
             log.error("webhook: treść nie jest JSON-em: %s", (request.data or b"")[:200])
             return jsonify(ok=False, reason="brak JSON"), 400
     if not _auth(payload): log.warning("webhook: zły sekret"); return jsonify(ok=False, reason="unauthorized"), 401
-    try: res = handle_signal(payload)
+    try:
+        res = handle_signal(payload)
     except Exception as e:
-        log.exception("webhook: błąd"); return jsonify(ok=False, reason=str(e)), 500
-    log.info("webhook -> %s", res); return jsonify(res)
+        log.exception("WEBHOOK BŁĄD: %s", e)
+        return jsonify(ok=False, reason=str(e)), 500
+    log.info("WYNIK: %s", res)
+    return jsonify(res)
 
 @app.get("/accounts")
 def list_accounts():
