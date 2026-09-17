@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.5, 17.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.6, 17.09.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
@@ -85,6 +85,7 @@ class CapitalClient:
         self.s = requests.Session()
         self.cst = None; self.xst = None; self.logged_at = 0
         self.lock = threading.Lock()
+        self.balance_cache = None      # (saldo, dostępne, znacznik czasu) - odświeżane przez nadzorcę
 
     def _hdr(self, auth=True):
         h = {"X-CAP-API-KEY": CFG["CAPITAL_API_KEY"], "Content-Type": "application/json"}
@@ -93,7 +94,9 @@ class CapitalClient:
         return h
 
     def login(self):
-        with self.lock:
+        if not self.lock.acquire(timeout=30):
+            raise RuntimeError("logowanie: inny wątek trzyma blokadę sesji >30 s")
+        try:
             r = self.s.post(BASE_URL + "/api/v1/session", headers=self._hdr(auth=False),
                             json={"identifier": CFG["CAPITAL_IDENTIFIER"], "password": CFG["CAPITAL_PASSWORD"],
                                   "encryptedPassword": False}, timeout=CFG["HTTP_TIMEOUT"])
@@ -108,12 +111,14 @@ class CapitalClient:
                     raise RuntimeError(f"nie można przełączyć rachunku na {acc}: {r2.text[:200]}")
                 log.info("przełączono aktywny rachunek na %s", acc)
             eff = CFG["CAPITAL_ACCOUNT_ID"] or body.get("currentAccountId")
-            log.info("zalogowano do Capital.com (%s), AKTYWNY RACHUNEK: %s", CFG["CAPITAL_ENV"], eff)
+            log.info("zalogowano do Capital.com (%s), AKTYWNY RACHUNEK: %s", CFG["CAPITAL_ENV"], eff)  # noqa
             for a in body.get("accounts", []):
                 b = a.get("balance", {})
                 log.info("RACHUNEK %s | %s | %s | saldo %s | dostępne %s | domyślny=%s", a.get("accountId"), a.get("accountName"),
                          a.get("currency"), b.get("balance"), b.get("available"), a.get("preferred"))
             self.accounts_cache = body.get("accounts", [])
+        finally:
+            self.lock.release()
 
     def call(self, method, path, retry=True, **kw):
         if not self.cst or time.time() - self.logged_at > 540:   # sesja wygasa po 10 min bezczynności
@@ -133,10 +138,14 @@ class CapitalClient:
     def positions(self):       return self.call("GET", "/api/v1/positions").get("positions", [])
     def balance(self):
         acc = CFG["CAPITAL_ACCOUNT_ID"]
-        for a in self.accounts():
-            if (acc and a["accountId"] == acc) or (not acc and a.get("preferred")):
-                return float(a["balance"]["balance"]), float(a["balance"]["available"])
-        a = self.accounts()[0]; return float(a["balance"]["balance"]), float(a["balance"]["available"])
+        accs = self.accounts()
+        pick = None
+        for a in accs:
+            if (acc and a["accountId"] == acc) or (not acc and a.get("preferred")): pick = a; break
+        pick = pick or accs[0]
+        bal = float(pick["balance"]["balance"]); avail = float(pick["balance"]["available"])
+        self.balance_cache = (bal, avail, time.time())
+        return bal, avail
     # --- zlecenia (limit brokera: max 1 żądanie / 0,1 s na pozycjach)
     def open_buy(self, epic, size, stop_dist, profit_dist):
         time.sleep(0.15)
@@ -338,6 +347,8 @@ def supervisor():
             if time.time() - last_ping > 300:
                 api.ping(); last_ping = time.time()
             broker = bot_position_ours()                       # sieć poza blokadą
+            try: api.balance()                                  # odświeża cache dla /status
+            except Exception: pass
             to_close = None
             with st.lock:
                 pos = st.d["position"]
@@ -391,10 +402,17 @@ def health():
 
 @app.get("/status")
 def status():
-    try: balance, available = api.balance()
-    except Exception as e: balance, available = None, f"broker niedostępny: {e}"
+    live = request.args.get("live") == "1"
+    if live:
+        try: balance, available = api.balance(); cache_age = 0
+        except Exception as e: balance, available, cache_age = None, f"broker niedostępny: {e}", None
+    elif api.balance_cache:
+        balance, available, ts = api.balance_cache; cache_age = round(time.time() - ts)
+    else:
+        balance, available, cache_age = None, "brak odczytu (nadzorca jeszcze nie odpytał brokera)", None
     return jsonify(env=CFG["CAPITAL_ENV"], armed=CFG["ARMED"], trading_enabled=CFG["TRADING_ENABLED"], halted=st.d["halted"],
-                   halt_reason=st.d["halt_reason"], balance=balance, available=available, position=st.d["position"],
+                   halt_reason=st.d["halt_reason"], balance=balance, available=available,
+                   balance_sprzed_sek=cache_age, position=st.d["position"],
                    day_pnl=st.d["day_pnl"], last_signal=st.d["last_signal"], trades=st.d["trades"][-10:],
                    guard=f"{CFG['GUARD_START']}-{CFG['GUARD_END']} {CFG['TZ']}", tp_pct=CFG["TP_PCT"], sl_pct=CFG["SL_PCT"],
                    time_stop_min=CFG["TIME_STOP_MIN"], close_by=CFG["CLOSE_BY"], risk_fraction=CFG["RISK_FRACTION"])
