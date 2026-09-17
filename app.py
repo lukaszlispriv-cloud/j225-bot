@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.6, 17.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.7, 17.09.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
@@ -341,14 +341,20 @@ def _any_epic_long():
 def supervisor():
     """Nadzorca: keep-alive, time-stop/CLOSE_BY, wykrycie zamknięcia przez TP/SL.
     Zapytania sieciowe wykonywane POZA blokadą stanu, żeby nigdy nie blokować obsługi webhooka."""
-    last_ping = 0; closed_market_until = 0
+    last_ping = 0; closed_market_until = 0; last_beat = 0
+    log.info("nadzorca wystartował w procesie pid=%s", os.getpid())
     while True:
         try:
             if time.time() - last_ping > 300:
                 api.ping(); last_ping = time.time()
+            try: api.balance()                                  # odświeża cache dla /status (niezależnie od pozycji)
+            except Exception as e: log.warning("nadzorca: saldo niedostępne: %s", e)
+            if time.time() - last_beat > 600:
+                bc = api.balance_cache
+                log.info("PULS nadzorcy pid=%s | saldo=%s | pozycja=%s", os.getpid(), bc[0] if bc else None,
+                         (st.d.get("position") or {}).get("deal_id"))
+                last_beat = time.time()
             broker = bot_position_ours()                       # sieć poza blokadą
-            try: api.balance()                                  # odświeża cache dla /status
-            except Exception: pass
             to_close = None
             with st.lock:
                 pos = st.d["position"]
@@ -503,15 +509,31 @@ def keepalive():
         try: requests.get(url, timeout=8)
         except Exception as e: log.debug("keepalive: %s", e)
 
-startup_banner()
-threading.Thread(target=supervisor, daemon=True).start()
-if CFG["KEEPALIVE_URL"]:
-    threading.Thread(target=keepalive, daemon=True).start()
-    log.info("keep-alive włączony: %s co 10 min", CFG["KEEPALIVE_URL"])
-else:
-    log.warning("keep-alive wyłączony. Na planie Free usługa zaśnie po ~15 min i webhook z TradingView PRZEPADNIE. "
-                "Ustaw KEEPALIVE_URL=<adres usługi> lub monitor UptimeRobot co 5 min.")
+_bg_started_pid = None
+_bg_lock = threading.Lock()
+
+def start_background():
+    """Uruchamia nadzorcę (i keep-alive) w BIEŻĄCYM procesie - wołane z post_fork gunicorna oraz awaryjnie
+    przy pierwszym żądaniu. Wątki nie przeżywają fork-a, dlatego nie wolno ich startować przy imporcie modułu."""
+    global _bg_started_pid
+    with _bg_lock:
+        if _bg_started_pid == os.getpid():
+            return
+        _bg_started_pid = os.getpid()
+        startup_banner()
+        threading.Thread(target=supervisor, daemon=True, name="nadzorca").start()
+        if CFG["KEEPALIVE_URL"]:
+            threading.Thread(target=keepalive, daemon=True, name="keepalive").start()
+            log.info("keep-alive włączony: %s co 10 min", CFG["KEEPALIVE_URL"])
+        log.info("wątki tła uruchomione w procesie pid=%s", os.getpid())
+
+@app.before_request
+def _ensure_background():
+    if _bg_started_pid != os.getpid():
+        start_background()
 if __name__ == "__main__":
     import sys
     if "--selftest" in sys.argv: _selftest()
-    else: app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    else:
+        start_background()
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
