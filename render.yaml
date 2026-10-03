@@ -17,9 +17,9 @@ services:
       - key: RISK_FRACTION
         value: "0.10"
       - key: TP_PCT
-        value: "1.2"
+        value: "1.0"
       - key: SL_PCT
-        value: "0.3"
+        value: "0.6"
       - key: TIME_STOP_MIN
         value: "240"
       - key: CLOSE_BY

@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v1.7, 17.09.2026)
+BOT STRATEGIA J225 5m  —  "LONG w konsolidacji"   (v2.0, 03.10.2026)
 =====================================================================
 Webhook TradingView  ->  Capital.com (REST API)  ->  jedna pozycja LONG na J225.
 
 Reguły strategii (zwalidowane walk-forward):
   * sygnał: alert TradingView (CHOP(14)>60  AND  Strażnik 02:00-09:00 PL  AND  C_5r15MinPMCandleBuy)
   * wejście: natychmiast po alercie, po cenie rynkowej (BUY)
-  * take profit  +1,2 %  od ceny wypełnienia   (zlecenie u brokera)
-  * stop loss    -0,3 %  od ceny wypełnienia   (zlecenie u brokera)
+  * take profit  +1,0 %  od ceny wypełnienia   (zlecenie u brokera)        [v2.0]
+  * stop loss    -0,6 %  od ceny wypełnienia   (zlecenie u brokera)        [v2.0]
+  * break-even: po +0,4 % stop przesuwany na wejście +0,02 %               [v2.0]
   * time-stop: zamknięcie po 4 h LUB o 09:00 czasu polskiego - co wcześniej (wątek nadzorcy)
   * jedna pozycja naraz; wielkość = RISK_FRACTION (10 %) salda rachunku jako depozyt
   * bot ignoruje sygnały poza oknem 02:00-08:54 PL (drugie zabezpieczenie obok Strażnika)
@@ -46,8 +47,10 @@ CFG = dict(
     FX_EPIC            = env("FX_EPIC", "USDJPY"),                        # do przeliczenia nominału
     FX_FALLBACK        = env("FX_FALLBACK", 148.0, float),
     RISK_FRACTION      = env("RISK_FRACTION", 0.10, float),               # 10 % salda jako depozyt
-    TP_PCT             = env("TP_PCT", 1.2, float),
-    SL_PCT             = env("SL_PCT", 0.3, float),
+    TP_PCT             = env("TP_PCT", 1.0, float),                # v2.0: 1.0 (było 1.2)
+    SL_PCT             = env("SL_PCT", 0.6, float),                # v2.0: 0.6 (było 0.3 - połowa zakresu 1h J225, wybijany knotami)
+    BE_TRIGGER_PCT     = env("BE_TRIGGER_PCT", 0.4, float),        # v2.0: po +0.4% stop na break-even (0 = wyłączone)
+    BE_OFFSET_PCT      = env("BE_OFFSET_PCT", 0.02, float),        # stop BE = wejście + 0.02% (pokrywa spread)
     TIME_STOP_MIN      = env("TIME_STOP_MIN", 240, int),
     CLOSE_BY           = env("CLOSE_BY", "09:00"),                        # czas lokalny TZ
     GUARD_START        = env("GUARD_START", "02:00"),
@@ -306,7 +309,7 @@ def handle_signal(payload):
 
     with st.lock:
         st.d["position"] = dict(deal_id=deal_id, level=level, size=size, open_time=str(t), deadline=str(deadline_for(t)),
-                                sl=round(level * (1 - sl_pct / 100), 1), tp=round(level * (1 + tp_pct / 100), 1))
+                                sl=round(level * (1 - sl_pct / 100), 1), tp=round(level * (1 + tp_pct / 100), 1), be_done=False)
         st.d["own_deals"] = (st.d.get("own_deals", []) + [deal_id])[-50:]
         st.save(); pos = st.d["position"]
     log.info("OTWARTO LONG %s size=%s @ %s TP=%s SL=%s deadline=%s (łącznie %.1fs)",
@@ -342,6 +345,7 @@ def supervisor():
     """Nadzorca: keep-alive, time-stop/CLOSE_BY, wykrycie zamknięcia przez TP/SL.
     Zapytania sieciowe wykonywane POZA blokadą stanu, żeby nigdy nie blokować obsługi webhooka."""
     last_ping = 0; closed_market_until = 0; last_beat = 0
+    _last_upl = {}
     log.info("nadzorca wystartował w procesie pid=%s", os.getpid())
     while True:
         try:
@@ -367,9 +371,26 @@ def supervisor():
                     log.warning("odbudowano stan pozycji z brokera: %s", pos)
                 if pos is not None:
                     if broker is None or broker["dealId"] != pos["deal_id"]:
-                        _settle(pos, reason="TP/SL brokera")
+                        _settle(pos, reason="TP/SL brokera", upl=_last_upl.get(pos["deal_id"]))
                     elif now_local() >= datetime.fromisoformat(pos["deadline"]) and time.time() >= closed_market_until:
                         to_close = pos
+                    else:
+                        _last_upl[pos["deal_id"]] = broker.get("upl")
+            # --- break-even: po osiągnięciu BE_TRIGGER przesuń stop na wejście (+offset) - raz, poza blokadą
+            if pos is not None and broker is not None and CFG["BE_TRIGGER_PCT"] > 0 and not pos.get("be_done"):
+                try:
+                    bid = float(broker.get("bid") or 0) or float(api.market(CFG["EPIC"])["snapshot"]["bid"])
+                    lvl = float(pos["level"])
+                    if bid >= lvl * (1 + CFG["BE_TRIGGER_PCT"] / 100):
+                        new_sl = round(lvl * (1 + CFG["BE_OFFSET_PCT"] / 100), 1)
+                        if CFG["ARMED"]:
+                            api.update_levels(pos["deal_id"], new_sl, pos.get("tp"))
+                        with st.lock:
+                            st.d["position"]["sl"] = new_sl; st.d["position"]["be_done"] = True; st.save()
+                        log.info("BREAK-EVEN: bid %.1f >= %.1f -> stop przesunięty na %.1f (deal %s)", bid,
+                                 lvl * (1 + CFG["BE_TRIGGER_PCT"] / 100), new_sl, pos["deal_id"])
+                except Exception as e:
+                    log.warning("break-even nieudany: %s", e)
             if to_close is not None:                           # sieć poza blokadą
                 if CFG["ARMED"]:
                     try:
@@ -421,7 +442,8 @@ def status():
                    balance_sprzed_sek=cache_age, position=st.d["position"],
                    day_pnl=st.d["day_pnl"], last_signal=st.d["last_signal"], trades=st.d["trades"][-10:],
                    guard=f"{CFG['GUARD_START']}-{CFG['GUARD_END']} {CFG['TZ']}", tp_pct=CFG["TP_PCT"], sl_pct=CFG["SL_PCT"],
-                   time_stop_min=CFG["TIME_STOP_MIN"], close_by=CFG["CLOSE_BY"], risk_fraction=CFG["RISK_FRACTION"])
+                   time_stop_min=CFG["TIME_STOP_MIN"], close_by=CFG["CLOSE_BY"], risk_fraction=CFG["RISK_FRACTION"],
+                   be_trigger_pct=CFG["BE_TRIGGER_PCT"], version="2.0")
 
 @app.post("/webhook")
 def webhook():
@@ -487,10 +509,12 @@ def startup_banner():
     log.info("=" * 70)
     log.info("BOT J225 5m LONG | env=%s | rachunek=%s | ARMED=%s | TRADING_ENABLED=%s",
              CFG["CAPITAL_ENV"], CFG["CAPITAL_ACCOUNT_ID"] or "(domyślny)", CFG["ARMED"], CFG["TRADING_ENABLED"])
-    log.info("okno wejść %s-%s %s | TP %.2f%% | SL %.2f%% | time-stop %d min | zamknięcie %s | depozyt %.0f%% salda",
-             CFG["GUARD_START"], CFG["GUARD_END"], CFG["TZ"], CFG["TP_PCT"], CFG["SL_PCT"],
+    log.info("okno wejść %s-%s %s | TP %.2f%% | SL %.2f%% | BE po +%.2f%% | time-stop %d min | zamknięcie %s | depozyt %.0f%% salda",
+             CFG["GUARD_START"], CFG["GUARD_END"], CFG["TZ"], CFG["TP_PCT"], CFG["SL_PCT"], CFG["BE_TRIGGER_PCT"],
              CFG["TIME_STOP_MIN"], CFG["CLOSE_BY"], CFG["RISK_FRACTION"] * 100)
     log.info("adres dla TradingView: <adres-usługi>/webhook   (sprawdzenie stanu: /status)")
+    if CFG["SL_PCT"] < 0.5:
+        log.warning("UWAGA: SL_PCT=%.2f%% jest poniżej zalecanego 0.6%% (v2.0) - stop będzie wybijany knotami świec J225.", CFG["SL_PCT"])
     if not CFG["WEBHOOK_SECRET"]:
         log.critical("UWAGA: WEBHOOK_SECRET jest PUSTY - bot odrzuci KAŻDY sygnał (401). Ustaw zmienną w Render.")
     if not CFG["ARMED"]:
